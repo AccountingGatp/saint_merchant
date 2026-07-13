@@ -138,30 +138,53 @@ export default function Home() {
     setResult(null);
 
     try {
-      // 1) Upload each CSV straight to Vercel Blob (bypasses the request-size
-      //    cap), collecting the resulting URLs.
-      const fileUrls: Record<string, string> = {};
-      for (const s of SLOTS) {
-        const f = files[s.id];
-        if (!f) continue;
-        const blob = await upload(f.name, f, {
-          access: "public",
-          handleUploadUrl: `${BACKEND_URL}/api/blob/token`,
-          contentType: f.type || "text/csv",
-        });
-        fileUrls[s.id] = blob.url;
+      // Use Blob only when the backend reports it's configured (Vercel). Locally
+      // (no BLOB_READ_WRITE_TOKEN) fall back to a normal multipart upload.
+      let blobEnabled = false;
+      try {
+        const health = await fetch(`${BACKEND_URL}/health`).then((r) => r.json());
+        blobEnabled = Boolean(health?.blob);
+      } catch {
+        // ignore — treat as multipart
       }
 
-      // 2) Send only the URLs to the API (tiny JSON body).
-      const res = await fetch(`${BACKEND_URL}/api/process`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ files: fileUrls }),
-      });
-      const data = await res.json();
+      let data: ProcessResult & { message?: string };
+      if (blobEnabled) {
+        // 1) Upload each CSV straight to Vercel Blob (bypasses the 4.5 MB cap).
+        const fileUrls: Record<string, string> = {};
+        for (const s of SLOTS) {
+          const f = files[s.id];
+          if (!f) continue;
+          const blob = await upload(f.name, f, {
+            access: "public",
+            handleUploadUrl: `${BACKEND_URL}/api/blob/token`,
+            contentType: f.type || "text/csv",
+          });
+          fileUrls[s.id] = blob.url;
+        }
+        // 2) Send only the URLs to the API (tiny JSON body).
+        const res = await fetch(`${BACKEND_URL}/api/process`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ files: fileUrls }),
+        });
+        data = await res.json();
+      } else {
+        // Multipart upload (local dev / no Blob configured).
+        const form = new FormData();
+        SLOTS.forEach((s) => {
+          const f = files[s.id];
+          if (f) form.append(s.id, f, f.name);
+        });
+        const res = await fetch(`${BACKEND_URL}/api/process`, {
+          method: "POST",
+          body: form,
+        });
+        data = await res.json();
+      }
 
-      if (!res.ok || !data.ok) {
-        toast.error(data?.message ?? `Processing failed (${res.status}).`);
+      if (!data.ok) {
+        toast.error(data?.message ?? "Processing failed.");
         return;
       }
 
