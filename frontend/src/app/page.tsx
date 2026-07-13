@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
+import { upload } from "@vercel/blob/client";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
@@ -24,7 +25,7 @@ type GatewayRecon = {
   unallocated: { date: string; amount: number }[];
 };
 
-type GeneratedFile = { name: string; base64: string };
+type GeneratedFile = { name: string; base64?: string; url?: string };
 
 type ProcessResult = {
   ok: true;
@@ -59,6 +60,18 @@ function downloadBase64(name: string, base64: string) {
   a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** Download the result file, from a Blob URL (prod) or inline base64 (local). */
+function triggerDownload(file: GeneratedFile) {
+  if (file.url) {
+    const a = document.createElement("a");
+    a.href = file.url;
+    a.download = file.name;
+    a.click();
+  } else if (file.base64) {
+    downloadBase64(file.name, file.base64);
+  }
 }
 
 const SLOTS: UploadSlot[] = [
@@ -123,28 +136,38 @@ export default function Home() {
 
     setSubmitting(true);
     setResult(null);
-    const form = new FormData();
-    SLOTS.forEach((s) => {
-      const f = files[s.id];
-      if (f) form.append(s.id, f, f.name);
-    });
 
     try {
+      // 1) Upload each CSV straight to Vercel Blob (bypasses the request-size
+      //    cap), collecting the resulting URLs.
+      const fileUrls: Record<string, string> = {};
+      for (const s of SLOTS) {
+        const f = files[s.id];
+        if (!f) continue;
+        const blob = await upload(f.name, f, {
+          access: "public",
+          handleUploadUrl: `${BACKEND_URL}/api/blob/token`,
+          contentType: f.type || "text/csv",
+        });
+        fileUrls[s.id] = blob.url;
+      }
+
+      // 2) Send only the URLs to the API (tiny JSON body).
       const res = await fetch(`${BACKEND_URL}/api/process`, {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: fileUrls }),
       });
       const data = await res.json();
 
       if (!res.ok || !data.ok) {
-        // Validation / processing error from the backend (Step 1 etc.)
         toast.error(data?.message ?? `Processing failed (${res.status}).`);
         return;
       }
 
       const processed = data as ProcessResult;
       setResult(processed);
-      downloadBase64(processed.file.name, processed.file.base64);
+      triggerDownload(processed.file);
       if (processed.reconciled) {
         toast.success(`Reconciled. Downloaded ${processed.file.name}`);
       } else {
@@ -152,9 +175,11 @@ export default function Home() {
           `Downloaded ${processed.file.name} — some gateways did not fully reconcile.`,
         );
       }
-    } catch {
+    } catch (err) {
       toast.error(
-        `Could not reach the backend at ${BACKEND_URL}. Is it running?`,
+        err instanceof Error && /413|payload/i.test(err.message)
+          ? "Upload too large for the server. (Blob upload failed.)"
+          : `Upload/processing failed against ${BACKEND_URL}.`,
       );
     } finally {
       setSubmitting(false);
@@ -244,7 +269,7 @@ export default function Home() {
               type="button"
               size="sm"
               variant="outline"
-              onClick={() => downloadBase64(result.file.name, result.file.base64)}
+              onClick={() => triggerDownload(result.file)}
             >
               Download {result.file.name}
             </Button>

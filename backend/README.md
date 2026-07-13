@@ -17,6 +17,33 @@ npm start        # http://localhost:4000  (PORT env var to override)
 npm run typecheck
 ```
 
+## Uploads: local (multipart) vs Vercel (Blob)
+
+`POST /api/process` accepts **either**:
+
+- **Multipart** (`multipart/form-data`) with the 5 file fields — used locally.
+- **JSON** `{ "files": { "shopify-net-payments": "<blobUrl>", … } }` — the browser
+  uploads each CSV straight to **Vercel Blob** and sends only the URLs. This
+  sidesteps Vercel's **4.5 MB request-body limit** (the ~14 MB transactions file
+  would otherwise 413). The server fetches each blob, processes, and deletes the
+  input blobs afterward.
+
+When `BLOB_READ_WRITE_TOKEN` is set, the generated workbook is also written to
+Blob and the response returns `file.url` (a download URL) instead of `file.base64`,
+avoiding the 4.5 MB **response** cap too. Without the token (local), it returns
+`file.base64`.
+
+**Vercel setup for the backend project:**
+1. Storage → Create → **Blob** store, and connect it to the backend project
+   (this injects `BLOB_READ_WRITE_TOKEN`).
+2. Redeploy. `GET /health` reports `"blob": true` when configured.
+3. Point the frontend's `BACKEND_URL` at the backend deployment.
+
+> Remaining Vercel limit: function **duration** (10 s Hobby / 60 s Pro). The
+> 14 MB parse + FX calls run ~5–8 s; if you hit a timeout on Hobby, use Pro (and
+> `vercel.json` `functions.maxDuration: 60`) or host the Express app on a
+> persistent platform (Render/Railway/Fly).
+
 ## API
 
 ### `POST /api/process` — `multipart/form-data`
