@@ -12,7 +12,8 @@ const clean = (v: unknown): string | null => {
 };
 
 const PORT = Number(process.env.PORT ?? 4000);
-const BLOB_ENABLED = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
+const BLOB_ENABLED = false;
+// const BLOB_ENABLED = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
 const app = express();
 app.use(cors());
