@@ -17,27 +17,26 @@ npm start        # http://localhost:4000  (PORT env var to override)
 npm run typecheck
 ```
 
-## Uploads: local (multipart) vs Vercel (Blob)
+## Uploads: zipped bundle (default)
 
-`POST /api/process` accepts **either**:
+To stay under Vercel's **4.5 MB request-body limit** (the ~14 MB transactions
+file would otherwise 413), the browser **zips the 5 CSVs client-side** with
+`fflate` (CSVs deflate ~10× → ~17 MB becomes ~2 MB) and posts a single
+`multipart/form-data` field `bundle` = the `.zip`. The server unzips it in memory
+and reads each CSV by entry name `"<field-key>.csv"`. No Blob token, no external
+storage — works identically local and on Vercel.
 
-- **Multipart** (`multipart/form-data`) with the 5 file fields — used locally.
-- **JSON** `{ "files": { "shopify-net-payments": "<blobUrl>", … } }` — the browser
-  uploads each CSV straight to **Vercel Blob** and sends only the URLs. This
-  sidesteps Vercel's **4.5 MB request-body limit** (the ~14 MB transactions file
-  would otherwise 413). The server fetches each blob, processes, and deletes the
-  input blobs afterward.
+`POST /api/process` accepts, in priority order:
 
-When `BLOB_READ_WRITE_TOKEN` is set, the generated workbook is also written to
-Blob and the response returns `file.url` (a download URL) instead of `file.base64`,
-avoiding the 4.5 MB **response** cap too. Without the token (local), it returns
-`file.base64`.
+1. **`bundle`** multipart field — a zip containing `shopify-net-payments.csv`,
+   `shopify-total-sales.csv`, `shopify-payment-transactions.csv`,
+   `paypal-activity.csv`, `afterpay-settlement.csv` (default path).
+2. The 5 **individual** CSV multipart fields (by key).
+3. **JSON** `{ "files": { "<key>": "<blobUrl>" } }` — Vercel Blob URLs, used only
+   if `BLOB_READ_WRITE_TOKEN` is configured (optional alternative).
 
-**Vercel setup for the backend project:**
-1. Storage → Create → **Blob** store, and connect it to the backend project
-   (this injects `BLOB_READ_WRITE_TOKEN`).
-2. Redeploy. `GET /health` reports `"blob": true` when configured.
-3. Point the frontend's `BACKEND_URL` at the backend deployment.
+The response returns the workbook as `file.base64` (or `file.url` when Blob is
+enabled). `GET /health` reports `"blob"` so the client can pick a path.
 
 > Remaining Vercel limit: function **duration** (10 s Hobby / 60 s Pro). The
 > 14 MB parse + FX calls run ~5–8 s; if you hit a timeout on Hobby, use Pro (and

@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import { unzipSync } from "fflate";
 import { del, put } from "@vercel/blob";
 import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 import { runPipeline } from "./pipeline/index.js";
@@ -29,9 +30,11 @@ app.use(express.json({ limit: "1mb" }));
  */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024, files: FIELD_KEYS.length },
+  limits: { fileSize: 30 * 1024 * 1024, files: FIELD_KEYS.length + 1 },
 });
-const uploadFields = upload.fields(FIELD_KEYS.map((name) => ({ name, maxCount: 1 })));
+// Accept any field names so we can take either the 5 individual CSVs or a single
+// zipped `bundle` (client-side zip keeps the request under Vercel's 4.5 MB cap).
+const uploadFields = upload.any();
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "saint-merchant-backend", blob: BLOB_ENABLED });
@@ -92,10 +95,24 @@ async function collectBuffers(
     return { buffers, blobUrls };
   }
 
-  // Multipart mode (local dev).
-  const filesByField = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
+  // Multipart mode — map uploaded parts by field name.
+  const parts = (req.files ?? []) as Express.Multer.File[];
+  const byField = new Map(parts.map((f) => [f.fieldname, f]));
+
+  // Zip-bundle mode: one `bundle` field containing all 5 CSVs (small payload).
+  const bundle = byField.get("bundle");
+  if (bundle) {
+    const entries = unzipSync(new Uint8Array(bundle.buffer));
+    for (const key of FIELD_KEYS) {
+      const data = entries[`${key}.csv`] ?? entries[key];
+      if (data) buffers[key] = Buffer.from(data);
+    }
+    return { buffers, blobUrls };
+  }
+
+  // Individual CSV fields (one per gateway file).
   for (const key of FIELD_KEYS) {
-    const file = filesByField[key]?.[0];
+    const file = byField.get(key);
     if (file) buffers[key] = file.buffer;
   }
   return { buffers, blobUrls };

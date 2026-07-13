@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { upload } from "@vercel/blob/client";
+import { zipSync } from "fflate";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
@@ -138,50 +138,29 @@ export default function Home() {
     setResult(null);
 
     try {
-      // Use Blob only when the backend reports it's configured (Vercel). Locally
-      // (no BLOB_READ_WRITE_TOKEN) fall back to a normal multipart upload.
-      let blobEnabled = false;
-      try {
-        const health = await fetch(`${BACKEND_URL}/health`).then((r) => r.json());
-        blobEnabled = Boolean(health?.blob);
-      } catch {
-        // ignore — treat as multipart
+      // Zip the 5 CSVs client-side into one small payload. CSVs deflate ~10x,
+      // so the ~17 MB of files becomes ~2 MB — well under Vercel's 4.5 MB body
+      // cap — and it needs no Blob token.
+      const entries: Record<string, Uint8Array> = {};
+      for (const s of SLOTS) {
+        const f = files[s.id];
+        if (!f) continue;
+        entries[`${s.id}.csv`] = new Uint8Array(await f.arrayBuffer());
       }
+      const zipped = zipSync(entries, { level: 6 });
 
-      let data: ProcessResult & { message?: string };
-      if (blobEnabled) {
-        // 1) Upload each CSV straight to Vercel Blob (bypasses the 4.5 MB cap).
-        const fileUrls: Record<string, string> = {};
-        for (const s of SLOTS) {
-          const f = files[s.id];
-          if (!f) continue;
-          const blob = await upload(f.name, f, {
-            access: "public",
-            handleUploadUrl: `${BACKEND_URL}/api/blob/token`,
-            contentType: f.type || "text/csv",
-          });
-          fileUrls[s.id] = blob.url;
-        }
-        // 2) Send only the URLs to the API (tiny JSON body).
-        const res = await fetch(`${BACKEND_URL}/api/process`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ files: fileUrls }),
-        });
-        data = await res.json();
-      } else {
-        // Multipart upload (local dev / no Blob configured).
-        const form = new FormData();
-        SLOTS.forEach((s) => {
-          const f = files[s.id];
-          if (f) form.append(s.id, f, f.name);
-        });
-        const res = await fetch(`${BACKEND_URL}/api/process`, {
-          method: "POST",
-          body: form,
-        });
-        data = await res.json();
-      }
+      const form = new FormData();
+      form.append(
+        "bundle",
+        new Blob([zipped], { type: "application/zip" }),
+        "bundle.zip",
+      );
+
+      const res = await fetch(`${BACKEND_URL}/api/process`, {
+        method: "POST",
+        body: form,
+      });
+      const data: ProcessResult & { message?: string } = await res.json();
 
       if (!data.ok) {
         toast.error(data?.message ?? "Processing failed.");
@@ -198,12 +177,8 @@ export default function Home() {
           `Downloaded ${processed.file.name} — some gateways did not fully reconcile.`,
         );
       }
-    } catch (err) {
-      toast.error(
-        err instanceof Error && /413|payload/i.test(err.message)
-          ? "Upload too large for the server. (Blob upload failed.)"
-          : `Upload/processing failed against ${BACKEND_URL}.`,
-      );
+    } catch {
+      toast.error(`Upload/processing failed against ${BACKEND_URL}.`);
     } finally {
       setSubmitting(false);
     }
