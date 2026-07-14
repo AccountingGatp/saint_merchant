@@ -2,7 +2,6 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { zipSync } from "fflate";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
@@ -138,27 +137,48 @@ export default function Home() {
     setResult(null);
 
     try {
-      // Zip the 5 CSVs client-side into one small payload. CSVs deflate ~10x,
-      // so the ~17 MB of files becomes ~2 MB — well under Vercel's 4.5 MB body
-      // cap — and it needs no Blob token.
-      const entries: Record<string, Uint8Array> = {};
-      for (const s of SLOTS) {
-        const f = files[s.id];
-        if (!f) continue;
-        entries[`${s.id}.csv`] = new Uint8Array(await f.arrayBuffer());
-      }
-      const zipped = zipSync(entries, { level: 6 });
+      // 1. Ask the backend for presigned Backblaze B2 URLs (one per file).
+      const keys = SLOTS.map((s) => s.id);
+      const presignRes = await fetch(`${BACKEND_URL}/api/uploads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keys }),
+      });
+      const presign: {
+        ok?: boolean;
+        message?: string;
+        uploads?: Record<string, { uploadUrl: string; fileUrl: string }>;
+      } = await presignRes.json();
 
-      const form = new FormData();
-      form.append(
-        "bundle",
-        new Blob([zipped], { type: "application/zip" }),
-        "bundle.zip",
+      if (!presignRes.ok || !presign.ok || !presign.uploads) {
+        toast.error(presign.message ?? "Could not start the upload.");
+        return;
+      }
+      const uploads = presign.uploads;
+
+      // 2. Upload each CSV straight to B2 (bypasses Vercel's request-body cap).
+      await Promise.all(
+        SLOTS.map(async (s) => {
+          const f = files[s.id];
+          const target = uploads[s.id];
+          if (!f || !target) throw new Error(`Missing upload target for ${s.label}`);
+          const put = await fetch(target.uploadUrl, {
+            method: "PUT",
+            headers: { "Content-Type": "text/csv" },
+            body: f,
+          });
+          if (!put.ok) throw new Error(`Upload failed for ${s.label} (HTTP ${put.status})`);
+        }),
       );
+
+      // 3. Send only the (tiny) file URLs to the backend for processing.
+      const fileUrls: Record<string, string> = {};
+      for (const s of SLOTS) fileUrls[s.id] = uploads[s.id].fileUrl;
 
       const res = await fetch(`${BACKEND_URL}/api/process`, {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: fileUrls }),
       });
       const data: ProcessResult & { message?: string } = await res.json();
 

@@ -1,11 +1,10 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { unzipSync } from "fflate";
-import { del, put } from "@vercel/blob";
-import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 import { runPipeline } from "./pipeline/index.js";
-import { FIELD_KEYS, type FileBuffers, type ProcessParams } from "./types.js";
+import { FIELD_KEYS, type FieldKey, type FileBuffers, type ProcessParams } from "./types.js";
+import { B2_ENABLED, deleteByUrls, newUploadPrefix, presignUpload } from "./lib/b2.js";
 
 const clean = (v: unknown): string | null => {
   const s = typeof v === "string" ? v.trim() : "";
@@ -13,118 +12,108 @@ const clean = (v: unknown): string | null => {
 };
 
 const PORT = Number(process.env.PORT ?? 4000);
-// Blob is used only when a read-write token is present (Vercel deploy). Locally
-// it stays off and the multipart path is used instead.
-const BLOB_ENABLED = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
 const app = express();
 app.use(cors());
-// Blob-mode requests are tiny JSON payloads (a handful of URLs).
+// URL-mode requests are tiny JSON payloads (a handful of file URLs).
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * multer memoryStorage keeps uploaded files as in-memory Buffers (used for
- * local multipart uploads). On Vercel the 4.5 MB request-body cap makes direct
- * multipart uploads of the ~14 MB transactions file impossible, so the browser
- * uploads straight to Vercel Blob and only sends the URLs here.
+ * multer memoryStorage keeps uploaded files as in-memory Buffers. Nothing is
+ * ever written to disk. Used for direct multipart uploads (local dev / small
+ * files). For large uploads on hosts with request-body caps, the browser
+ * uploads to object storage (e.g. Backblaze B2) and sends the URLs instead.
  */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024, files: FIELD_KEYS.length + 1 },
+  limits: { fileSize: 30 * 1024 * 1024, files: FIELD_KEYS.length },
 });
-// Accept any field names so we can take either the 5 individual CSVs or a single
-// zipped `bundle` (client-side zip keeps the request under Vercel's 4.5 MB cap).
-const uploadFields = upload.any();
+const uploadFields = upload.fields(FIELD_KEYS.map((name) => ({ name, maxCount: 1 })));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "saint-merchant-backend", blob: BLOB_ENABLED });
+  res.json({ ok: true, service: "saint-merchant-backend", b2: B2_ENABLED });
 });
 
 /**
- * Vercel Blob client-upload token endpoint. The browser calls this (via
- * `@vercel/blob/client` `upload`) to get a short-lived token, then uploads the
- * CSV directly to Blob storage — never through this function's request body.
+ * Presign endpoint. The browser POSTs the file keys it wants to upload and gets
+ * back, per key, a presigned PUT URL (upload the CSV straight to Backblaze B2)
+ * and a presigned GET URL (which it echoes back in `/api/process`). This keeps
+ * the large file bodies off the Vercel function, avoiding the 4.5 MB / HTTP 413
+ * request-body cap.
  */
-app.post("/api/blob/token", async (req, res) => {
+app.post("/api/uploads", async (req, res) => {
   try {
-    const jsonResponse = await handleUpload({
-      body: req.body as HandleUploadBody,
-      request: req,
-      onBeforeGenerateToken: async () => ({
-        allowedContentTypes: [
-          "text/csv",
-          "application/vnd.ms-excel",
-          "application/octet-stream",
-          "text/plain",
-        ],
-        maximumSizeInBytes: 30 * 1024 * 1024,
-        addRandomSuffix: true,
+    if (!B2_ENABLED) {
+      return res
+        .status(503)
+        .json({ ok: false, message: "Object storage is not configured on the server." });
+    }
+    const body = (req.body ?? {}) as { keys?: unknown };
+    const requested = Array.isArray(body.keys) ? (body.keys as unknown[]) : FIELD_KEYS;
+    const keys = requested.filter(
+      (k): k is FieldKey => typeof k === "string" && (FIELD_KEYS as string[]).includes(k),
+    );
+
+    const prefix = newUploadPrefix();
+    const uploads: Record<string, { uploadUrl: string; fileUrl: string }> = {};
+    await Promise.all(
+      keys.map(async (key) => {
+        const { uploadUrl, fileUrl } = await presignUpload(prefix, key);
+        uploads[key] = { uploadUrl, fileUrl };
       }),
-      // We process on demand and delete the blobs afterwards, so no-op here.
-      onUploadCompleted: async () => {},
-    });
-    return res.json(jsonResponse);
+    );
+
+    return res.json({ ok: true, uploads });
   } catch (err) {
+    console.error("Presign error:", err);
     return res
-      .status(400)
-      .json({ error: err instanceof Error ? err.message : "token error" });
+      .status(500)
+      .json({ ok: false, message: err instanceof Error ? err.message : "Presign failed." });
   }
 });
 
-/** Resolve the 5 input buffers from either Blob URLs (JSON) or multipart. */
-async function collectBuffers(
-  req: express.Request,
-): Promise<{ buffers: FileBuffers; blobUrls: string[] }> {
+/**
+ * Resolve the 5 input buffers from either:
+ *  - JSON `{ files: { "<key>": "<url>" } }` — file URLs (e.g. Backblaze B2); the
+ *    server fetches each one, or
+ *  - multipart form fields — one CSV per gateway key.
+ */
+async function collectBuffers(req: express.Request): Promise<FileBuffers> {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const buffers: FileBuffers = {};
-  const blobUrls: string[] = [];
 
   const urlMap = body.files as Record<string, string> | undefined;
   if (urlMap && typeof urlMap === "object") {
-    // Blob mode — fetch each uploaded CSV from its Blob URL.
     await Promise.all(
       FIELD_KEYS.map(async (key) => {
         const url = urlMap[key];
         if (typeof url !== "string" || !url) return;
         const r = await fetch(url);
-        if (!r.ok) throw new Error(`Failed to fetch ${key} from Blob (${r.status})`);
+        if (!r.ok) throw new Error(`Failed to fetch ${key} (HTTP ${r.status})`);
         buffers[key] = Buffer.from(await r.arrayBuffer());
-        blobUrls.push(url);
       }),
     );
-    return { buffers, blobUrls };
+    return buffers;
   }
 
-  // Multipart mode — map uploaded parts by field name.
-  const parts = (req.files ?? []) as Express.Multer.File[];
-  const byField = new Map(parts.map((f) => [f.fieldname, f]));
-
-  // Zip-bundle mode: one `bundle` field containing all 5 CSVs (small payload).
-  const bundle = byField.get("bundle");
-  if (bundle) {
-    const entries = unzipSync(new Uint8Array(bundle.buffer));
-    for (const key of FIELD_KEYS) {
-      const data = entries[`${key}.csv`] ?? entries[key];
-      if (data) buffers[key] = Buffer.from(data);
-    }
-    return { buffers, blobUrls };
-  }
-
-  // Individual CSV fields (one per gateway file).
+  const filesByField = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
   for (const key of FIELD_KEYS) {
-    const file = byField.get(key);
+    const file = filesByField[key]?.[0];
     if (file) buffers[key] = file.buffer;
   }
-  return { buffers, blobUrls };
+  return buffers;
 }
 
 app.post("/api/process", uploadFields, async (req, res) => {
-  let blobUrls: string[] = [];
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const urlMap = body.files as Record<string, string> | undefined;
+  const inputUrls =
+    urlMap && typeof urlMap === "object"
+      ? Object.values(urlMap).filter((v): v is string => typeof v === "string" && !!v)
+      : [];
   try {
-    const collected = await collectBuffers(req);
-    blobUrls = collected.blobUrls;
+    const buffers = await collectBuffers(req);
 
-    const body = (req.body ?? {}) as Record<string, unknown>;
     const params: ProcessParams = {
       dateStart: clean(body.dateStart),
       dateEnd: clean(body.dateEnd),
@@ -132,24 +121,8 @@ app.post("/api/process", uploadFields, async (req, res) => {
       orderEnd: clean(body.orderEnd),
     };
 
-    const result = await runPipeline(collected.buffers, params);
+    const result = await runPipeline(buffers, params);
     if (!result.ok) return res.status(400).json(result);
-
-    // Return the workbook via Blob (avoids the 4.5 MB response cap) when Blob is
-    // configured; otherwise inline base64 for local dev.
-    if (BLOB_ENABLED) {
-      const buffer = Buffer.from(result.file.base64, "base64");
-      const out = await put(result.file.name, buffer, {
-        access: "public",
-        addRandomSuffix: true,
-        contentType:
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      });
-      return res.json({
-        ...result,
-        file: { name: result.file.name, url: out.downloadUrl },
-      });
-    }
     return res.json(result);
   } catch (err) {
     console.error("Pipeline error:", err);
@@ -159,9 +132,9 @@ app.post("/api/process", uploadFields, async (req, res) => {
       message: err instanceof Error ? err.message : "Unexpected processing error.",
     });
   } finally {
-    // Clean up the uploaded input blobs — nothing is retained.
-    if (blobUrls.length > 0) {
-      del(blobUrls).catch((e) => console.warn("Blob cleanup failed:", e));
+    // The app retains nothing — drop the uploaded input objects from B2.
+    if (inputUrls.length > 0) {
+      deleteByUrls(inputUrls).catch((e) => console.warn("B2 cleanup failed:", e));
     }
   }
 });

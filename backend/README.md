@@ -17,30 +17,53 @@ npm start        # http://localhost:4000  (PORT env var to override)
 npm run typecheck
 ```
 
-## Uploads: zipped bundle (default)
+## Uploads
 
-To stay under Vercel's **4.5 MB request-body limit** (the ~14 MB transactions
-file would otherwise 413), the browser **zips the 5 CSVs client-side** with
-`fflate` (CSVs deflate ~10× → ~17 MB becomes ~2 MB) and posts a single
-`multipart/form-data` field `bundle` = the `.zip`. The server unzips it in memory
-and reads each CSV by entry name `"<field-key>.csv"`. No Blob token, no external
-storage — works identically local and on Vercel.
+`POST /api/process` accepts **either**:
 
-`POST /api/process` accepts, in priority order:
+1. **Multipart** — the 5 CSV fields by key (`shopify-net-payments`,
+   `shopify-total-sales`, `shopify-payment-transactions`, `paypal-activity`,
+   `afterpay-settlement`). Simple; used locally / for small files.
+2. **JSON** `{ "files": { "<key>": "<url>" } }` — file **URLs**. The browser
+   uploads the CSVs to object storage (**Backblaze B2**) and sends only the URLs;
+   the server fetches each URL server-side and processes. This keeps the request
+   tiny, so hosts with a request-body cap (e.g. Vercel's 4.5 MB) don't 413 on the
+   ~14 MB transactions file.
 
-1. **`bundle`** multipart field — a zip containing `shopify-net-payments.csv`,
-   `shopify-total-sales.csv`, `shopify-payment-transactions.csv`,
-   `paypal-activity.csv`, `afterpay-settlement.csv` (default path).
-2. The 5 **individual** CSV multipart fields (by key).
-3. **JSON** `{ "files": { "<key>": "<blobUrl>" } }` — Vercel Blob URLs, used only
-   if `BLOB_READ_WRITE_TOKEN` is configured (optional alternative).
+### Direct-to-B2 upload flow (mode 2)
 
-The response returns the workbook as `file.base64` (or `file.url` when Blob is
-enabled). `GET /health` reports `"blob"` so the client can pick a path.
+Backblaze B2 is S3-compatible; the server uses the AWS S3 SDK to mint short-lived
+presigned URLs so the file bodies never pass through the (capped) function:
 
-> Remaining Vercel limit: function **duration** (10 s Hobby / 60 s Pro). The
-> 14 MB parse + FX calls run ~5–8 s; if you hit a timeout on Hobby, use Pro (and
-> `vercel.json` `functions.maxDuration: 60`) or host the Express app on a
+1. `POST /api/uploads` with `{ "keys": ["shopify-net-payments", …] }` →
+   `{ "ok": true, "uploads": { "<key>": { "uploadUrl": "<presigned PUT>", "fileUrl": "<presigned GET>" } } }`.
+2. The browser `PUT`s each CSV straight to its `uploadUrl` (`Content-Type: text/csv`).
+3. The browser calls `POST /api/process` with `{ "files": { "<key>": "<fileUrl>" } }`.
+   The server fetches each object, processes, and **deletes the input objects**
+   from B2 afterward (nothing is retained).
+
+**Required env vars** (set locally in `backend/.env`, and in the Vercel project):
+
+```
+B2_ENDPOINT=https://s3.<region>.backblazeb2.com
+B2_REGION=<region>            # e.g. us-east-005
+B2_BUCKET=<bucket-name>
+B2_KEY_ID=<application-key-id>
+B2_APP_KEY=<application-key>
+B2_URL_EXPIRY=600             # presigned-URL lifetime, seconds (optional)
+```
+
+`GET /health` reports `"b2": true` once these are set. **The bucket must have a
+CORS rule** allowing `PUT`/`GET` from the frontend origin with the `content-type`
+header — otherwise the browser's direct upload is blocked by CORS (server-side
+`curl` is unaffected, so test in the actual browser).
+
+Optional `dateStart`/`dateEnd`/`orderStart`/`orderEnd` may accompany either mode.
+The response returns the workbook as `file.base64`.
+
+> On Vercel serverless, note the function **duration** limit (10 s Hobby / 60 s
+> Pro): the 14 MB parse + FX calls run ~5–8 s. If you hit a timeout, use Pro
+> (`vercel.json` `functions.maxDuration: 60`) or host the Express app on a
 > persistent platform (Render/Railway/Fly).
 
 ## API
