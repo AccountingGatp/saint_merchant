@@ -116,6 +116,11 @@ export default function Home() {
   const [files, setFiles] = useState<Record<string, File | null>>({});
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<ProcessResult | null>(null);
+  // Optional date range (ISO yyyy-mm-dd). Empty = no bound on that side.
+  const [dateStart, setDateStart] = useState("");
+  const [dateEnd, setDateEnd] = useState("");
+
+  const rangeInvalid = Boolean(dateStart && dateEnd && dateStart > dateEnd);
 
   const uploadedCount = useMemo(
     () => SLOTS.filter((s) => files[s.id]).length,
@@ -130,6 +135,10 @@ export default function Home() {
   const handleSubmit = async () => {
     if (!allReady) {
       toast.error("Please upload all 5 files before continuing.");
+      return;
+    }
+    if (rangeInvalid) {
+      toast.error("The start date must be on or before the end date.");
       return;
     }
 
@@ -178,7 +187,12 @@ export default function Home() {
       const res = await fetch(`${BACKEND_URL}/api/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ files: fileUrls }),
+        body: JSON.stringify({
+          files: fileUrls,
+          // Only include a bound the user actually set; blank = no filter.
+          ...(dateStart ? { dateStart } : {}),
+          ...(dateEnd ? { dateEnd } : {}),
+        }),
       });
       const data: ProcessResult & { message?: string } = await res.json();
 
@@ -207,6 +221,8 @@ export default function Home() {
   const handleClear = () => {
     setFiles({});
     setResult(null);
+    setDateStart("");
+    setDateEnd("");
     toast.info("Cleared all selected files.");
   };
 
@@ -245,6 +261,58 @@ export default function Home() {
         ))}
       </div>
 
+      <div className="mt-3 rounded-md border bg-card px-3 py-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <div className="flex flex-col">
+            <span className="text-xs font-medium">Date range</span>
+            <span className="text-[10px] text-muted-foreground">
+              Optional — output only orders in this range
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              From
+              <input
+                type="date"
+                value={dateStart}
+                max={dateEnd || undefined}
+                onChange={(e) => setDateStart(e.target.value)}
+                className="h-8 rounded-md border bg-background px-2 text-xs text-foreground"
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              To
+              <input
+                type="date"
+                value={dateEnd}
+                min={dateStart || undefined}
+                onChange={(e) => setDateEnd(e.target.value)}
+                className="h-8 rounded-md border bg-background px-2 text-xs text-foreground"
+              />
+            </label>
+            {(dateStart || dateEnd) && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8"
+                onClick={() => {
+                  setDateStart("");
+                  setDateEnd("");
+                }}
+              >
+                Reset
+              </Button>
+            )}
+          </div>
+        </div>
+        {rangeInvalid && (
+          <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+            The start date must be on or before the end date.
+          </p>
+        )}
+      </div>
+
       <div className="mt-4 flex items-center justify-end gap-2">
         <Button
           type="button"
@@ -259,7 +327,7 @@ export default function Home() {
           type="button"
           size="sm"
           onClick={handleSubmit}
-          disabled={!allReady || submitting}
+          disabled={!allReady || submitting || rangeInvalid}
         >
           {submitting ? "Processing…" : "Upload & reconcile"}
         </Button>
