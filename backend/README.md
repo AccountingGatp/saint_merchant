@@ -1,8 +1,8 @@
 # Saint Merchant — Backend
 
 In-memory processing pipeline that reconciles merchant fees across **Shopify
-Payments, PayPal, and Afterpay** from 5 uploaded CSV reports and generates 3
-Excel fee-detail files.
+Payments, PayPal, and Afterpay** from 5 uploaded CSV reports and generates a
+single 4-sheet Excel workbook (Combined Summary + per-gateway fee sheets).
 
 > **No storage, anywhere.** Uploaded files are held only as in-memory buffers
 > (`multer.memoryStorage`), processed, and discarded when the request ends.
@@ -114,59 +114,82 @@ Send the 5 files under these field names:
 }
 ```
 
-Decode `file.base64` to bytes and save as the `.xlsx`.
-- **Output** — every order across all gateways in one AUD table + TOTAL row.
-- **Shopify / Afterpay / PayPal** — the per-gateway order-level fee sheets.
+Decode `file.base64` to bytes and save as the `.xlsx`. Sheets:
+- **Combined Summary** — stacked date-wise pivot blocks (Afterpay, PayPal,
+  Shopify Payments), each with per-day rows and a Grand Total.
+- **Shopify Fees / Afterpay Fees / PayPal Fees** — the per-gateway order-level
+  fee sheets.
 
-(The backend also accepts optional `dateStart`/`dateEnd`/`orderStart`/`orderEnd`
-form fields to filter by date/order range; the UI does not send them.)
+The backend also accepts optional `dateStart`/`dateEnd` (ISO `yyyy-mm-dd`,
+inclusive) and `orderStart`/`orderEnd` (Shopify order names, e.g. `#10053`) to
+filter by date/order range. The UI sends `dateStart`/`dateEnd` from its
+date-range selector; a range scopes both the orders **and** each gateway's daily
+fee pool (only order-days in range are sourced).
 
 ### `GET /health`
 
-`{ "ok": true, "service": "saint-merchant-backend" }`
+`{ "ok": true, "service": "saint-merchant-backend", "b2": true }`
 
 ## Pipeline (`src/pipeline/`)
 
-| Step | File | What it does |
+The reconciliation is a port of the standalone `merchant_fees.xlsx` generator,
+living in `combine.ts` (self-contained: CSV parse, pro-rata allocator, and a
+dependency-free XLSX writer). `index.ts` validates, calls `combine`, and maps
+the result into the JSON response.
+
+| Step | Where | What it does |
 | ---- | ---- | ------------ |
-| 1 — Validate | `validate.ts` | File presence, CSV format, required columns |
-| 2 — Normalize | `orders.ts` (+ `lib/csv.ts`) | CSV → normalized rows |
-| 3–4 — Master orders + split | `orders.ts` | Build `orders[]` from Net Payments (source of truth), aggregate duplicate rows, apply **date/order-range filters**, split by gateway (`shopify_payments` / `paypal` / `Afterpay (New)`) |
-| 5 — Shopify fees | `shopifyFees.ts` | Each order's ACTUAL `Fee`/`GST` summed per `Order` from Payment Transactions |
-| 6 — Afterpay fees | `afterpayFees.ts` (+ `lib/allocate.ts`) | Daily settlement fees allocated to Shopify order names, pro-rata by gross−refund |
-| 7 — PayPal fees | `paypalFees.ts` (+ `lib/fx.ts`, `lib/allocate.ts`) | Fees → AUD via historical FX, daily pool allocated to Shopify order names |
-| 8 — Excel | `excel.ts` | Build the single 4-sheet merchant workbook in memory |
-| 9 — Reconcile | `reconcile.ts` | Per-gateway daily source-vs-allocated; reports mismatches + unallocated days |
-| 10 — Result | `index.ts` | Assemble summary, reconciliation, adjustments, files |
+| 1 — Validate | `validate.ts` (+ `lib/csv.ts`) | File presence, CSV format, required columns |
+| 2 — Orders | `combine.ts` | Build `orders[]` from Net Payments (source of truth), apply **date/order-range filters**, key each order by day + gateway |
+| 3 — Daily fee pools | `combine.ts` | Per gateway/day, total the fee from that gateway's own source report (AUD) |
+| 4 — Allocate | `combine.ts` | Distribute each day's pool across that day's orders pro-rata by net payment (gross−refund), forced to tie per day |
+| 5 — Workbook | `combine.ts` | Build the 4-sheet workbook (Combined Summary + 3 gateway sheets) in memory |
+| 6 — Reconcile + result | `combine.ts` / `index.ts` | Per-gateway allocated-vs-source totals, unallocated days, ±1¢ adjustments, summary |
 
 ### How each gateway's fees are sourced
 
-- **Shopify** — the Payment Transactions export has a per-order `Order` column
-  with actual `Fee`/`GST`, so each order's fee is summed directly (no
-  allocation) and scoped to the Net-Payments orders in range.
-- **Afterpay** — the settlement Merchant Order ID is an Afterpay token that
-  never matches Shopify order numbers, so daily settlement fees are **allocated**
-  across the Net-Payments Afterpay orders pro-rata by gross−refund, keyed by the
-  settlement row's order date. OrderID is the Shopify order name.
-- **PayPal** — fees are charged in each transaction's own currency, so every
-  fee-bearing row is **converted to AUD** (Frankfurter / ECB daily rates,
-  `lib/fx.ts`, nearest-prior-business-day fallback), the daily AUD fee pool is
-  **allocated** across the Net-Payments PayPal orders pro-rata by gross−refund.
-  PayPal merchant fees are GST-exempt. Order gross is AUD (OriginalCurrency=AUD).
+All three gateways use the **same daily-pool + pro-rata** method: Net Payments
+defines which orders exist (their Order name, day, and gateway); each gateway's
+own report gives the day's total fee, which is allocated across that day's orders.
+
+- **Shopify Payments** — daily pool from Payment Transactions (`charge` / `refund`
+  / `chargeback` rows), summing `Fee`/`GST` at face value (already AUD, no FX).
+- **Afterpay** — daily pool from the settlement report's `Merchant Fee excl Tax`
+  / `Merchant Fee Tax`, keyed by `ISO Settlement Date`. (The Afterpay Merchant
+  Order ID is a token that never matches Shopify order names, hence allocation.)
+- **PayPal** — daily pool from sales + refunds + withdrawal fees, converted to
+  AUD using **PayPal's own settlement rate** derived from the report's
+  "General Currency Conversion" pairs (foreign-out / AUD-in). Any remaining
+  foreign fees are converted at the **ECB historical rate for that transaction
+  date** (`lib/fx.ts`, Frankfurter API — free, no key, keyed by day). Only
+  currencies that can't be resolved at all are excluded and surfaced in
+  `fxWarnings`. PayPal fees are GST-exempt (all in the ex-GST bucket).
 
 ### Rounding / reconciliation
 
-All money math is in **integer cents** (`lib/money.ts`). Pro-rata allocation
-uses **largest-remainder** distribution (`lib/allocate.ts`) so each day's
-allocated fees sum EXACTLY to the source day total; the ±1¢ remainder placements
-are reported in `adjustments` (gateway/date/orderId). Source fee days that have
-no matching in-range order are left unallocated and reported per gateway in
-`reconciliation[].unallocated` — this is how a **file-period mismatch** surfaces
-(e.g. an Afterpay settlement whose settlement dates fall outside the Net-Payments
-window).
+Money is rounded to cents (`round2`). The pro-rata allocator forces each day's
+rounded fees to sum EXACTLY to the source day total by pushing the ±1-2¢ residual
+onto the largest-magnitude order; those placements are reported in `adjustments`
+(gateway/date/orderId/cents). Source fee days with no matching in-range order are
+reported per gateway in `reconciliation[].unallocated` — this is how a
+**file-period mismatch** surfaces (e.g. an Afterpay settlement whose settlement
+dates fall outside the selected window).
+
+### FX note
+
+FX is fully dynamic — nothing is hard-coded, so the pipeline is correct for any
+period. PayPal's own per-transaction settlement rate (from the report's
+conversion rows) is preferred; anything else is converted at the ECB reference
+rate for that transaction date via the Frankfurter API (`lib/fx.ts`). Rates are
+cached per `date|currency` (historical rates are immutable). If the FX service is
+unreachable or a currency is unsupported, those fees are excluded from AUD and
+listed in `fxWarnings`.
+
+> Requires outbound network access from the server to `api.frankfurter.dev`. On
+> Vercel this works by default; note the added latency (~one request per distinct
+> foreign-fee date) counts toward the function duration limit.
 
 ### Column matching
 
-Headers are matched by normalized aliases (case/spacing/punctuation-insensitive),
-so header variations across report exports are tolerated. See the alias lists in
-each pipeline module and `validate.ts`.
+`validate.ts` matches headers by normalized aliases; `combine.ts` reads the exact
+report headers (e.g. `Net payments`, `Transaction Date`, `ISO Settlement Date`).

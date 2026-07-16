@@ -1,5 +1,3 @@
-import { fromCents, toCents } from "../lib/money.js";
-import { monthLabel } from "../lib/date.js";
 import type {
   FileBuffers,
   PipelineResult,
@@ -7,43 +5,17 @@ import type {
   ValidationError,
 } from "../types.js";
 import { validate } from "./validate.js";
-import { buildOrders } from "./orders.js";
-import { processShopifyFees } from "./shopifyFees.js";
-import { processAfterpayFees } from "./afterpayFees.js";
-import { processPaypalFees } from "./paypalFees.js";
-import { generateMerchantWorkbook } from "./excel.js";
-
-/** Most common order month, used for output filenames (e.g. "Nov2025"). */
-function dominantMonth(dates: (string | null)[]): string {
-  const counts = new Map<string, number>();
-  for (const d of dates) {
-    if (!d) continue;
-    const ym = d.slice(0, 7);
-    counts.set(ym, (counts.get(ym) ?? 0) + 1);
-  }
-  let best: string | null = null;
-  let bestCount = 0;
-  for (const [ym, c] of counts) {
-    if (c > bestCount) {
-      best = ym;
-      bestCount = c;
-    }
-  }
-  return monthLabel(best ? `${best}-01` : null);
-}
-
-const sumField = <T extends object>(rows: T[], key: string): number =>
-  fromCents(
-    rows.reduce(
-      (acc, r) => acc + toCents(Number((r as Record<string, unknown>)[key] ?? 0)),
-      0,
-    ),
-  );
+import { combine } from "./combine.js";
 
 /**
  * Runs the full processing pipeline over in-memory file buffers, honouring the
  * optional date-range / order-range filters. Returns a ValidationError (Step 1)
- * or the final result with three fee-detail workbooks.
+ * or the final result with the combined merchant workbook.
+ *
+ * The reconciliation logic lives in `combine.ts` (a port of the standalone
+ * `merchant_fees.xlsx` generator): Net payments defines the orders; each
+ * gateway's daily fee pool is sourced from its own report (AUD) and allocated
+ * pro-rata across that day's orders, forced to tie per day.
  */
 export async function runPipeline(
   files: FileBuffers,
@@ -53,64 +25,20 @@ export async function runPipeline(
   const validationError = validate(files);
   if (validationError) return validationError;
 
-  // Steps 2-4 — Normalize, build master orders, filter, split by gateway.
-  const { orders, split } = buildOrders(files["shopify-net-payments"]!, params);
+  // Steps 2-9 — Build orders, source daily fee pools, allocate, reconcile, and
+  // render the 4-sheet workbook.
+  const result = await combine(files, params);
 
-  // Steps 5-7 — Process fees per gateway.
-  const shopify = processShopifyFees(
-    files["shopify-payment-transactions"]!,
-    split.shopifyOrders,
-  );
-  const afterpay = processAfterpayFees(
-    files["afterpay-settlement"]!,
-    split.afterpayOrders,
-    params,
-  );
-  const paypal = await processPaypalFees(
-    files["paypal-activity"]!,
-    split.paypalOrders,
-    params,
-  );
-
-  // Step 8 — Generate the single merchant workbook (in memory, 4 sheets:
-  // Output pivot + Afterpay / PayPal / Shopify detail).
-  const label = dominantMonth(orders.map((o) => o.date));
-  const file = await generateMerchantWorkbook(
-    label,
-    shopify.details,
-    afterpay.details,
-    paypal.details,
-  );
-
-  // Step 9 — Reconcile.
-  const reconciliation = [
-    shopify.reconciliation,
-    afterpay.reconciliation,
-    paypal.reconciliation,
-  ];
-  const reconciled = reconciliation.every((r) => r.reconciled);
-  const adjustments = [...afterpay.adjustments, ...paypal.adjustments];
-
-  // Step 10 — Return result.
+  const name = `Merchant_fees_${result.monthLabel}.xlsx`;
   return {
     ok: true,
-    monthLabel: label,
+    monthLabel: result.monthLabel,
     params,
-    summary: {
-      shopifyFees: sumField(shopify.details, "FeeInclGST"),
-      afterpayFees: sumField(afterpay.details, "MerchantFeeInclGST"),
-      paypalFees: sumField(paypal.details, "FeeAmountAUD"),
-      orderCounts: {
-        shopify: split.shopifyOrders.length,
-        paypal: split.paypalOrders.length,
-        afterpay: split.afterpayOrders.length,
-      },
-    },
-    reconciliation,
-    reconciled,
-    adjustments,
-    fxWarnings:
-      paypal.fxFailedCurrencies.length > 0 ? paypal.fxFailedCurrencies : undefined,
-    file,
+    summary: result.summary,
+    reconciliation: result.reconciliation,
+    reconciled: result.reconciled,
+    adjustments: result.adjustments,
+    fxWarnings: result.fxWarnings.length > 0 ? result.fxWarnings : undefined,
+    file: { name, base64: result.xlsx.toString("base64") },
   };
 }

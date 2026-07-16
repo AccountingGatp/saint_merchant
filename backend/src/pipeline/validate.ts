@@ -29,7 +29,10 @@ const COLUMN_REQUIREMENTS: Record<FieldKey, { name: string; aliases: string[] }[
     { name: "Currency", aliases: ["currency"] },
   ],
   "afterpay-settlement": [
-    { name: "Settlement Date", aliases: ["settlementdate", "date", "paymentdate"] },
+    {
+      name: "Settlement Date",
+      aliases: ["isosettlementdate", "settlementdate", "date", "paymentdate"],
+    },
     {
       name: "Merchant Fee",
       aliases: [
