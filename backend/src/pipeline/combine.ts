@@ -73,6 +73,27 @@ const money = (v: string | number | undefined | null): number => {
   return Number.isFinite(n) ? n : 0;
 };
 const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+
+/** FX attributes of a fee bucket (one Shopify order, or one PayPal day). */
+type FxAgg = { currency: string; rates: Set<number>; origIncl: number };
+
+/**
+ * Detail-sheet FX cells: [currency, feeOriginal, conversionRate]. The rate is
+ * exact when the bucket settled at a single rate, else the effective (blended)
+ * rate across dates. The currency is always shown — never "mixed". A bucket with
+ * no usable rate (currency unavailable) shows the currency with blank amount/rate.
+ *   inclAud  — the AUD fee incl-GST for THIS row.
+ *   audTotal — the bucket's total AUD incl-GST (effective-rate denominator).
+ */
+function fxCells(fx: FxAgg | undefined, inclAud: number, audTotal: number): [string, number | "", number | ""] {
+  if (!fx) return ["AUD", round2(inclAud), 1];
+  const eff = fx.rates.size === 1 ? [...fx.rates][0]
+    : fx.rates.size > 1 && audTotal !== 0 ? fx.origIncl / audTotal
+    : null;
+  if (eff == null) return [fx.currency, "", ""];
+  return [fx.currency, round2(inclAud * eff), round6(eff)];
+}
 
 // Normalise assorted date strings to YYYY-MM-DD.
 const MONTHS: Record<string, string> = {
@@ -96,6 +117,12 @@ function toISO(s: string): string {
 const orderNum = (name: string): number | null => {
   const mm = String(name || "").match(/(\d+)/);
   return mm ? parseInt(mm[1], 10) : null;
+};
+
+/** Stable key for matching an order across files (by number, else by name). */
+const orderKey = (name: string): string => {
+  const n = orderNum(name);
+  return n != null ? String(n) : (name || "").trim().toUpperCase();
 };
 
 function gatewayOf(raw: string): Gateway | null {
@@ -252,25 +279,84 @@ function buildXlsx(sheets: { name: string; rows: Cell[][] }[]): Buffer {
   return zip(files);
 }
 
+// Pick a column value by header name, tolerant of case/spacing/punctuation.
+const normHeader = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+function pickCol(row: CsvRow, names: string[]): string {
+  const wanted = names.map(normHeader);
+  for (const k of Object.keys(row)) {
+    if (wanted.includes(normHeader(k)) && row[k]) return row[k];
+  }
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // Build daily fee pools (AUD) per gateway from the source reports.
 // ---------------------------------------------------------------------------
-function shopifyPools(buf: Buffer, days: Set<string>): Record<string, Pool> {
+
+/** One converted Shopify fee row, tagged with the order it belongs to. */
+interface ShopifyFeeRow {
+  orderKey: string;  // matches an order by number (via orderKey)
+  iso: string;       // the payout transaction date (when the fee settled)
+  ex: number;        // fee excl-GST, AUD
+  gst: number;       // GST on fee, AUD
+  currency: string;  // the payout's settlement currency
+  rate: number | null; // foreign per AUD at the payout date (1 for AUD, null if unavailable)
+  origIncl: number;  // fee incl-GST in the original currency
+}
+
+/**
+ * Read the Shopify payout (Payment Transactions) file and return the actual
+ * per-transaction fees, tagged by order number so each order's fee is looked up
+ * directly (not allocated by date). Fee/GST are in the row's settlement currency
+ * (the `Currency` column); non-AUD rows are converted to AUD at the RBA rate for
+ * that transaction date. The whole file is read — matching to in-range orders is
+ * done later, so a payout that settles after the Net-payments date still counts.
+ */
+async function shopifyOrderFees(
+  buf: Buffer,
+  fxWarnings: Set<string>,
+): Promise<ShopifyFeeRow[]> {
   const rows = readCsv(buf);
-  const pools: Record<string, Pool> = {};
   const feeTypes = new Set(["charge", "refund", "chargeback", "chargeback won"]);
-  for (const r of rows) {
+  const kept = rows.filter((r) => feeTypes.has((r["Type"] || "").toLowerCase()));
+
+  const currencyOf = (r: CsvRow): string =>
+    (pickCol(r, ["Currency", "Payout Currency"]) || "AUD").toUpperCase();
+
+  // Collect (date, non-AUD currency) pairs for conversion.
+  const needed = new Map<string, Set<string>>();
+  for (const r of kept) {
+    const cur = currencyOf(r);
+    if (cur === "AUD") continue;
     const iso = toISO(r["Transaction Date"]);
-    if (!days.has(iso)) continue;
-    if (!feeTypes.has((r["Type"] || "").toLowerCase())) continue;
-    // Fee/GST are already in AUD; per spec, summed at face value (no FX).
-    const feeIncl = money(r["Fee"]);
-    const gst = money(r["GST"]);
-    (pools[iso] || (pools[iso] = { ex: 0, gst: 0 }));
-    pools[iso].ex += feeIncl - gst;
-    pools[iso].gst += gst;
+    (needed.get(iso) || needed.set(iso, new Set()).get(iso)!).add(cur);
   }
-  return pools;
+  const rba = await resolveAudRates(needed); // `${iso}|${CUR}` -> foreign per AUD | null
+
+  const out: ShopifyFeeRow[] = [];
+  for (const r of kept) {
+    const iso = toISO(r["Transaction Date"]);
+    const cur = currencyOf(r);
+    const origIncl = money(r["Fee"]); // fee incl-GST in the original currency
+    let feeIncl = origIncl;
+    let gst = money(r["GST"]);
+    let rate: number | null = 1; // AUD needs no conversion
+    if (cur !== "AUD") {
+      rate = rba.get(`${iso}|${cur}`) ?? null; // foreign per AUD, at the payout date
+      if (rate == null) { fxWarnings.add(cur); feeIncl = 0; gst = 0; } // unavailable -> excluded
+      else { feeIncl /= rate; gst /= rate; }
+    }
+    out.push({
+      orderKey: orderKey(pickCol(r, ["Order", "Order Name", "Order ID"])),
+      iso,
+      ex: feeIncl - gst,
+      gst,
+      currency: cur,
+      rate,
+      origIncl,
+    });
+  }
+  return out;
 }
 
 function afterpayPools(buf: Buffer, days: Set<string>): Record<string, Pool> {
@@ -445,18 +531,60 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
     orders.push({ iso, gateway, OrderID: name, weight: netAmt, gross, refunded, netAmt });
   }
 
-  // 2. Daily fee pools per gateway (AUD). PayPal may fetch historical FX rates.
+  // 2. Fee sources.
+  //  - Shopify: exact per-order fees from the payout file, matched by order number.
+  //  - Afterpay / PayPal: daily fee pools allocated pro-rata by date.
   const fxWarn = new Set<string>();
   const paypal = await paypalPools(files["paypal-activity"]!, days, fxWarn);
-  const pools: Record<Gateway, Record<string, Pool>> = {
-    "Shopify Payments": shopifyPools(files["shopify-payment-transactions"]!, days),
+  const shopifyFeeRows = await shopifyOrderFees(files["shopify-payment-transactions"]!, fxWarn);
+  const pools: Record<"Afterpay" | "PayPal", Record<string, Pool>> = {
     "Afterpay": afterpayPools(files["afterpay-settlement"]!, days),
     "PayPal": paypal.pools,
   };
 
-  // 3. Allocate each day's pool across that day's orders, per gateway.
+  // 3a. Shopify — assign each order its own fee (summed from the payout rows that
+  // share its order number). Duplicate Net-payments rows for one order split that
+  // order's fee pro-rata so nothing is double-counted.
+  const feeByOrder = new Map<string, Pool>();
+  // Per-order FX for the detail sheet: settlement currency, the distinct rates
+  // used (>1 when payout rows settled on different dates), and the total fee in
+  // the original currency.
+  const orderFx = new Map<string, { currency: string; rates: Set<number>; origIncl: number }>();
+  for (const f of shopifyFeeRows) {
+    const acc = feeByOrder.get(f.orderKey) || feeByOrder.set(f.orderKey, { ex: 0, gst: 0 }).get(f.orderKey)!;
+    acc.ex += f.ex;
+    acc.gst += f.gst;
+    const fx = orderFx.get(f.orderKey)
+      || orderFx.set(f.orderKey, { currency: f.currency, rates: new Set(), origIncl: 0 }).get(f.orderKey)!;
+    if (f.currency !== "AUD") fx.currency = f.currency; // prefer the foreign label
+    if (f.rate != null) fx.rates.add(f.rate);
+    fx.origIncl += f.origIncl;
+  }
+  const shopifyGroups = new Map<string, OrderRow[]>();
+  for (const o of orders) {
+    if (o.gateway !== "Shopify Payments") continue;
+    const k = orderKey(o.OrderID);
+    (shopifyGroups.get(k) || shopifyGroups.set(k, []).get(k)!).push(o);
+  }
+  for (const [k, group] of shopifyGroups) {
+    allocate(group, feeByOrder.get(k) || { ex: 0, gst: 0 });
+  }
+
+  // Per-day PayPal FX for the detail sheet (PayPal fees are pooled by day, so an
+  // order's currency/rate come from its day's pool). Same shape as Shopify's.
+  const paypalDayFx = new Map<string, FxAgg & { audIncl: number }>();
+  for (const f of paypal.fx) {
+    const d = paypalDayFx.get(f.iso)
+      || paypalDayFx.set(f.iso, { currency: "AUD", rates: new Set(), origIncl: 0, audIncl: 0 }).get(f.iso)!;
+    if (f.currency !== "AUD") d.currency = f.currency; // prefer the foreign label
+    if (f.rate != null) d.rates.add(f.rate);
+    d.origIncl += f.feeOriginal;
+    d.audIncl += f.feeAud;
+  }
+
+  // 3b. Afterpay / PayPal — allocate each day's pool across that day's orders.
   const adjustments: RoundingAdjustment[] = [];
-  for (const gateway of GATEWAYS) {
+  for (const gateway of ["Afterpay", "PayPal"] as const) {
     const byDay: Record<string, OrderRow[]> = {};
     orders.filter((o) => o.gateway === gateway).forEach((o) => (byDay[o.iso] || (byDay[o.iso] = [])).push(o));
     for (const iso of Object.keys(byDay)) {
@@ -506,12 +634,21 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
     bump(o.iso, o.gateway, gross, ex, gst, incl, netAud);
 
     if (o.gateway === "Shopify Payments") {
-      sheetRows["Shopify Payments"].push([o.iso, o.OrderID, gross, ex, gst, incl, netAud]);
+      const k = orderKey(o.OrderID);
+      const audTotal = round2((feeByOrder.get(k)?.ex ?? 0) + (feeByOrder.get(k)?.gst ?? 0));
+      const [currency, feeOriginal, rate] = fxCells(orderFx.get(k), incl, audTotal);
+      sheetRows["Shopify Payments"].push(
+        [o.iso, o.OrderID, gross, ex, gst, incl, netAud, currency, feeOriginal, rate],
+      );
     } else if (o.gateway === "Afterpay") {
       sheetRows["Afterpay"].push([o.iso, o.OrderID, gross, ex, gst, incl, netAud]);
     } else {
       // PayPal fees are GST-exempt -> FeeAmountAUD = incl. Gross basis is Net payments (AUD).
-      sheetRows["PayPal"].push([o.iso, o.OrderID, "AUD", gross, gross, incl, netAud, type]);
+      const day = paypalDayFx.get(o.iso);
+      const [currency, feeOriginal, rate] = fxCells(day, incl, day?.audIncl ?? 0);
+      sheetRows["PayPal"].push(
+        [o.iso, o.OrderID, "AUD", gross, gross, incl, netAud, type, currency, feeOriginal, rate],
+      );
     }
   }
 
@@ -560,7 +697,6 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
 
   // PayPal FX sheet — the actual currency, original-currency fee amount, the
   // conversion rate (foreign per 1 AUD) and its source, per day × currency.
-  const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
   const fxSorted = [...paypal.fx].sort(
     (a, b) => a.iso.localeCompare(b.iso) || a.currency.localeCompare(b.currency),
   );
@@ -584,15 +720,18 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
 
   const xlsx = buildXlsx([
     { name: "Combined Summary", rows: summaryRows },
-    { name: "Shopify Fees", rows: [["Date", "OrderID", "GrossAmountAUD", "FeeExGST", "GSTOnFee", "FeeInclGST", "NetAmountAUD"], ...sheetRows["Shopify Payments"]] },
+    { name: "Shopify Fees", rows: [["Date", "OrderID", "GrossAmountAUD", "FeeExGST", "GSTOnFee", "FeeInclGST", "NetAmountAUD", "Currency", "FeeOriginal", "ConversionRate (A$1=)"], ...sheetRows["Shopify Payments"]] },
     { name: "Afterpay Fees", rows: [["Date", "OrderID", "GrossAmountAUD", "MerchantFeeExclGST", "MerchantFeeGST", "MerchantFeeInclGST", "NetAmountAUD"], ...sheetRows["Afterpay"]] },
-    { name: "PayPal Fees", rows: [["Date", "OrderID", "OriginalCurrency", "GrossOriginalCurrency", "GrossAmountAUD", "FeeAmountAUD", "NetAmountAUD", "Type"], ...sheetRows["PayPal"]] },
+    { name: "PayPal Fees", rows: [["Date", "OrderID", "OriginalCurrency", "GrossOriginalCurrency", "GrossAmountAUD", "FeeAmountAUD", "NetAmountAUD", "Type", "Currency", "FeeOriginal", "ConversionRate (A$1=)"], ...sheetRows["PayPal"]] },
     { name: "PayPal FX", rows: paypalFxRows },
   ]);
 
-  // 5. Reconciliation per gateway: allocated vs full source pool; report any
-  // source-pool days that had no matching orders (fees dropped -> unallocated).
-  const reconciliation: GatewayReconciliation[] = GATEWAYS.map((g) => {
+  // 5. Reconciliation per gateway.
+  //  - Afterpay / PayPal: allocated vs the daily source pool; source-pool days
+  //    with no matching order are reported as unallocated.
+  //  - Shopify: allocated vs the payout file total; fees whose order number is
+  //    not in the in-range order set are reported as unallocated (by settle date).
+  const poolRecon = (g: "Afterpay" | "PayPal"): GatewayReconciliation => {
     const pool = pools[g];
     const orderDays = new Set(orders.filter((o) => o.gateway === g).map((o) => o.iso));
     let sourceEx = 0, sourceGst = 0;
@@ -609,15 +748,39 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
     const allocatedTotal = round2(totals[g].incl);
     const difference = round2(allocatedTotal - sourceTotal);
     return {
-      gateway: g,
-      reconciled: Math.abs(difference) < 0.005,
-      sourceTotal,
-      allocatedTotal,
-      difference,
-      dailyMismatches: [], // per-day allocation always ties to the pool
-      unallocated,
+      gateway: g, reconciled: Math.abs(difference) < 0.005,
+      sourceTotal, allocatedTotal, difference,
+      dailyMismatches: [], unallocated,
     };
-  });
+  };
+
+  const shopifyRecon = (): GatewayReconciliation => {
+    const matched = new Set(shopifyGroups.keys()); // order numbers present in range
+    let sourceEx = 0, sourceGst = 0;
+    const unmatchedByDate = new Map<string, number>();
+    for (const f of shopifyFeeRows) {
+      sourceEx += f.ex;
+      sourceGst += f.gst;
+      if (!matched.has(f.orderKey)) {
+        unmatchedByDate.set(f.iso, (unmatchedByDate.get(f.iso) ?? 0) + f.ex + f.gst);
+      }
+    }
+    const unallocated = [...unmatchedByDate.entries()]
+      .map(([date, amt]) => ({ date, amount: round2(amt) }))
+      .filter((u) => Math.abs(u.amount) >= 0.005);
+    const sourceTotal = round2(sourceEx + sourceGst);
+    const allocatedTotal = round2(totals["Shopify Payments"].incl);
+    const difference = round2(allocatedTotal - sourceTotal);
+    return {
+      gateway: "Shopify Payments", reconciled: Math.abs(difference) < 0.005,
+      sourceTotal, allocatedTotal, difference,
+      dailyMismatches: [], unallocated,
+    };
+  };
+
+  const reconciliation: GatewayReconciliation[] = [
+    shopifyRecon(), poolRecon("Afterpay"), poolRecon("PayPal"),
+  ];
   const reconciled = reconciliation.every((r) => r.reconciled);
 
   return {

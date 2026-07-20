@@ -2,7 +2,8 @@
 
 In-memory processing pipeline that reconciles merchant fees across **Shopify
 Payments, PayPal, and Afterpay** from 5 uploaded CSV reports and generates a
-single 4-sheet Excel workbook (Combined Summary + per-gateway fee sheets).
+single 5-sheet Excel workbook (Combined Summary + per-gateway fee sheets + a
+PayPal FX breakdown).
 
 > **No storage, anywhere.** Uploaded files are held only as in-memory buffers
 > (`multer.memoryStorage`), processed, and discarded when the request ends.
@@ -141,22 +142,28 @@ the result into the JSON response.
 | ---- | ---- | ------------ |
 | 1 — Validate | `validate.ts` (+ `lib/csv.ts`) | File presence, CSV format, required columns |
 | 2 — Orders | `combine.ts` | Build `orders[]` from Net Payments (source of truth), apply **date/order-range filters**, key each order by day + gateway |
-| 3 — Daily fee pools | `combine.ts` | Per gateway/day, total the fee from that gateway's own source report (AUD) |
-| 4 — Allocate | `combine.ts` | Distribute each day's pool across that day's orders pro-rata by net payment (gross−refund), forced to tie per day |
-| 5 — Workbook | `combine.ts` | Build the 4-sheet workbook (Combined Summary + 3 gateway sheets) in memory |
-| 6 — Reconcile + result | `combine.ts` / `index.ts` | Per-gateway allocated-vs-source totals, unallocated days, ±1¢ adjustments, summary |
+| 3 — Fees | `combine.ts` | Shopify: exact per-order fee matched by order number. Afterpay/PayPal: daily fee pool from each report |
+| 4 — Assign / allocate | `combine.ts` | Shopify: attach each order's own fee. Afterpay/PayPal: distribute each day's pool pro-rata by net payment, tied per day |
+| 5 — Workbook | `combine.ts` | Build the 5-sheet workbook (Combined Summary + 3 gateway sheets + PayPal FX) in memory |
+| 6 — Reconcile + result | `combine.ts` / `index.ts` | Per-gateway allocated-vs-source totals, unallocated fees, ±1¢ adjustments, summary |
 
 ### How each gateway's fees are sourced
 
-All three gateways use the **same daily-pool + pro-rata** method: Net Payments
-defines which orders exist (their Order name, day, and gateway); each gateway's
-own report gives the day's total fee, which is allocated across that day's orders.
+Net Payments defines which orders exist (Order name, day, gateway). Fees are then:
 
-- **Shopify Payments** — daily pool from Payment Transactions (`charge` / `refund`
-  / `chargeback` rows), summing `Fee`/`GST` at face value (already AUD, no FX).
+- **Shopify Payments** — **exact per-order**: each order's fee is summed from the
+  Payment Transactions (payout) rows that carry its **`Order` number**
+  (`charge`/`refund`/`chargeback`), *not* matched by date — so a payout that
+  settles **after** the Net-payments date still lands on the right order. Fee/GST
+  are read in the payout's **`Currency`** column and converted to AUD at the RBA
+  rate for the **payout transaction date** when that currency isn't AUD. Payout
+  fees whose order number isn't in the in-range set are reported as
+  `unallocated`. (Duplicate Net-payments rows for one order split that order's fee
+  pro-rata, so nothing is double-counted.)
 - **Afterpay** — daily pool from the settlement report's `Merchant Fee excl Tax`
-  / `Merchant Fee Tax`, keyed by `ISO Settlement Date`. (The Afterpay Merchant
-  Order ID is a token that never matches Shopify order names, hence allocation.)
+  / `Merchant Fee Tax`, keyed by `ISO Settlement Date`, allocated across that
+  day's Afterpay orders. (The Afterpay Merchant Order ID is a token that never
+  matches Shopify order names, hence allocation.)
 - **PayPal** — daily pool from sales + refunds + withdrawal fees, converted to
   AUD using **PayPal's own settlement rate** derived from the report's
   "General Currency Conversion" pairs (foreign-out / AUD-in). Any remaining
@@ -167,13 +174,13 @@ own report gives the day's total fee, which is allocated across that day's order
 
 ### Rounding / reconciliation
 
-Money is rounded to cents (`round2`). The pro-rata allocator forces each day's
-rounded fees to sum EXACTLY to the source day total by pushing the ±1-2¢ residual
-onto the largest-magnitude order; those placements are reported in `adjustments`
-(gateway/date/orderId/cents). Source fee days with no matching in-range order are
-reported per gateway in `reconciliation[].unallocated` — this is how a
-**file-period mismatch** surfaces (e.g. an Afterpay settlement whose settlement
-dates fall outside the selected window).
+Money is rounded to cents (`round2`). For Afterpay/PayPal the pro-rata allocator
+forces each day's rounded fees to sum EXACTLY to the source day total by pushing
+the ±1-2¢ residual onto the largest-magnitude order; those placements are reported
+in `adjustments`. Fees that don't tie to an in-range order are reported in
+`reconciliation[].unallocated` — for Afterpay/PayPal a source fee **day** with no
+matching order, for Shopify a payout **fee row** whose order number isn't in the
+selected set. This is how a **file-period mismatch** surfaces.
 
 ### FX note
 
