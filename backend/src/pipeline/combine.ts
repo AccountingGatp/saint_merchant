@@ -26,10 +26,9 @@ import { resolveAudRates } from "../lib/fx.js";
 const GATEWAYS = ["Shopify Payments", "Afterpay", "PayPal"] as const;
 type Gateway = (typeof GATEWAYS)[number];
 
-// FX is fully dynamic: PayPal's own settlement rate (derived from the report's
-// currency-conversion rows) is preferred; any remaining foreign fees are
-// converted at the ECB historical rate for that transaction date (see lib/fx.ts).
-// Nothing is hard-coded, so the pipeline is correct for any period.
+// FX is fully dynamic: every non-AUD PayPal fee is converted at the RBA
+// historical rate for that transaction date (see lib/fx.ts). Nothing is
+// hard-coded, so the pipeline is correct for any period.
 
 // ---------------------------------------------------------------------------
 // CSV helpers
@@ -289,48 +288,37 @@ function afterpayPools(buf: Buffer, days: Set<string>): Record<string, Pool> {
   return pools;
 }
 
-// Derive PayPal's own effective FX (AUD per 1 unit of foreign currency) from the
-// report's "General Currency Conversion" rows (matched foreign-out / AUD-in
-// pairs sharing a Reference Txn ID). Low-volume currencies fall back to RBA.
-const MIN_CONV_VOLUME = 1000;
-function paypalFxRates(rows: CsvRow[]) {
-  const agg: Record<string, { foreign: number; aud: number }> = {};
-  const pairs: Record<string, CsvRow[]> = {};
-  for (const r of rows) {
-    if ((r["Type"] || "").toLowerCase() !== "general currency conversion") continue;
-    const ref = r["Reference Txn ID"] || r["Transaction ID"];
-    (pairs[ref] || (pairs[ref] = [])).push(r);
-  }
-  for (const ref of Object.keys(pairs)) {
-    const p = pairs[ref];
-    const aud = p.find((x) => (x["Currency"] || "") === "AUD");
-    const fx = p.find((x) => (x["Currency"] || "") !== "AUD");
-    if (!aud || !fx) continue;
-    const c = fx["Currency"].toUpperCase();
-    const a = agg[c] || (agg[c] = { foreign: 0, aud: 0 });
-    a.foreign += Math.abs(money(fx["Gross"]));
-    a.aud += Math.abs(money(aud["Gross"]));
-  }
-  const rates: Record<string, number> = { AUD: 1 };
-  const reliable: Record<string, boolean> = { AUD: true };
-  for (const c of Object.keys(agg)) {
-    rates[c] = agg[c].aud / agg[c].foreign;
-    reliable[c] = agg[c].foreign >= MIN_CONV_VOLUME;
-  }
-  return { rates, reliable };
-}
 
 // sales + refunds + withdrawal/payout fees (the full PayPal cost pool).
 const PAYPAL_FEE_TYPES = new Set(["pre-approved payment bill user payment",
   "payment refund", "general payment", "user initiated withdrawal"]);
 
+/** One row of the PayPal FX breakdown: the fee in its original currency for a
+ * given day, the rate used to reach AUD, and where that rate came from. */
+interface PaypalFxRow {
+  iso: string;
+  currency: string;
+  /** Fee cost in the original currency (positive = cost). */
+  feeOriginal: number;
+  /** Fee cost in AUD (positive = cost). */
+  feeAud: number;
+  /** Conversion rate as foreign units per 1 AUD (A$1 = rate). null if excluded. */
+  rate: number | null;
+  /** "AUD" (no conversion) | "RBA" (RBA rate for the date) | "excluded". */
+  source: string;
+}
+
+interface PaypalResult {
+  pools: Record<string, Pool>;
+  fx: PaypalFxRow[];
+}
+
 async function paypalPools(
   buf: Buffer,
   days: Set<string>,
   fxWarnings: Set<string>,
-): Promise<Record<string, Pool>> {
+): Promise<PaypalResult> {
   const rows = readCsv(buf);
-  const { rates: ppRate, reliable } = paypalFxRates(rows);
 
   // Which fee rows count toward the pool.
   const feeRows = rows.filter((r) => {
@@ -340,36 +328,46 @@ async function paypalPools(
       && PAYPAL_FEE_TYPES.has((r["Type"] || "").toLowerCase());
   });
 
-  // Pass 1 — collect (date, currency) pairs that need an ECB rate (i.e. not AUD
-  // and not reliably derivable from PayPal's own conversion rows).
+  // Pass 1 — collect every (date, non-AUD currency) pair; all conversions use the
+  // RBA rate for that date.
   const needed = new Map<string, Set<string>>();
   for (const r of feeRows) {
     const c = (r["Currency"] || "AUD").toUpperCase();
-    if (c === "AUD" || (ppRate[c] != null && reliable[c])) continue;
+    if (c === "AUD") continue;
     const iso = toISO(r["Date"]);
     (needed.get(iso) || needed.set(iso, new Set()).get(iso)!).add(c);
   }
-  const ecb = await resolveAudRates(needed); // `${iso}|${CUR}` -> foreign per AUD | null
+  const rba = await resolveAudRates(needed); // `${iso}|${CUR}` -> foreign per AUD | null
 
-  const ppToAud = (amount: number, cur: string, iso: string): number => {
+  // Convert one fee to AUD at the RBA rate (foreign per AUD) for that date.
+  const convert = (amount: number, cur: string, iso: string) => {
     const c = (cur || "AUD").toUpperCase();
-    if (c === "AUD") return amount;
-    if (ppRate[c] != null && reliable[c]) return amount * ppRate[c]; // PayPal's own rate
-    const rate = ecb.get(`${iso}|${c}`); // ECB historical rate for that day
-    if (rate == null) { fxWarnings.add(c); return 0; } // unavailable -> excluded from AUD
-    return amount / rate;
+    if (c === "AUD") return { aud: amount, rate: 1, source: "AUD" };
+    const rate = rba.get(`${iso}|${c}`); // RBA historical rate (foreign per AUD)
+    if (rate == null) { fxWarnings.add(c); return { aud: 0, rate: null, source: "excluded" }; }
+    return { aud: amount / rate, rate, source: "RBA" };
   };
 
-  // Pass 2 — build the daily pools.
+  // Pass 2 — build the daily pools + the per-day/currency FX breakdown.
   const pools: Record<string, Pool> = {};
+  const fxByKey = new Map<string, PaypalFxRow>();
   for (const r of feeRows) {
     const iso = toISO(r["Date"]);
-    const feeAud = ppToAud(money(r["Fee"]), r["Currency"], iso); // fees are negative in report
+    const currency = (r["Currency"] || "AUD").toUpperCase();
+    const feeOrig = money(r["Fee"]); // negative in the report
+    const { aud, rate, source } = convert(feeOrig, currency, iso);
+
     (pools[iso] || (pools[iso] = { ex: 0, gst: 0 }));
-    pools[iso].ex += -feeAud; // PayPal fees are GST-exempt -> all in ex-GST bucket
+    pools[iso].ex += -aud; // PayPal fees are GST-exempt -> all in ex-GST bucket
     pools[iso].gst += 0;
+
+    const key = `${iso}|${currency}`;
+    const row = fxByKey.get(key)
+      || (fxByKey.set(key, { iso, currency, feeOriginal: 0, feeAud: 0, rate, source }).get(key)!);
+    row.feeOriginal += -feeOrig; // accumulate as a positive cost
+    row.feeAud += -aud;
   }
-  return pools;
+  return { pools, fx: [...fxByKey.values()] };
 }
 
 // ---------------------------------------------------------------------------
@@ -449,10 +447,11 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
 
   // 2. Daily fee pools per gateway (AUD). PayPal may fetch historical FX rates.
   const fxWarn = new Set<string>();
+  const paypal = await paypalPools(files["paypal-activity"]!, days, fxWarn);
   const pools: Record<Gateway, Record<string, Pool>> = {
     "Shopify Payments": shopifyPools(files["shopify-payment-transactions"]!, days),
     "Afterpay": afterpayPools(files["afterpay-settlement"]!, days),
-    "PayPal": await paypalPools(files["paypal-activity"]!, days, fxWarn),
+    "PayPal": paypal.pools,
   };
 
   // 3. Allocate each day's pool across that day's orders, per gateway.
@@ -550,20 +549,45 @@ export async function combine(files: FileBuffers, params: ProcessParams): Promis
         "Sum of MerchantFeeGST", "Sum of MerchantFeeInclGST", "Sum of NetAmountAUD"],
       (a) => [a.n, round2(a.gross), round2(a.ex), round2(a.gst), round2(a.incl), round2(a.net)]),
     ...block("Paypal", "PayPal",
-      ["Row Labels", "Count of OrderID", "Sum of GrossOriginalCurrency", "Sum of GrossAmountAUD",
+      ["Row Labels", "Count of OrderID", "Sum of GrossAmountAUD",
         "Sum of FeeAmountAUD", "Sum of NetAmountAUD"],
-      (a) => [a.n, round2(a.gross), round2(a.gross), round2(a.incl), round2(a.net)]),
+      (a) => [a.n, round2(a.gross), round2(a.incl), round2(a.net)]),
     ...block("Shopify Payments", "Shopify Payments",
       ["Row Labels", "Count of OrderID", "Sum of GrossAmountAUD", "Sum of FeeExGST",
         "Sum of GSTOnFee", "Sum of FeeInclGST", "Sum of NetAmountAUD"],
       (a) => [a.n, round2(a.gross), round2(a.ex), round2(a.gst), round2(a.incl), round2(a.net)]),
   ];
 
+  // PayPal FX sheet — the actual currency, original-currency fee amount, the
+  // conversion rate (foreign per 1 AUD) and its source, per day × currency.
+  const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+  const fxSorted = [...paypal.fx].sort(
+    (a, b) => a.iso.localeCompare(b.iso) || a.currency.localeCompare(b.currency),
+  );
+  const paypalFxRows: Cell[][] = [
+    ["Date", "Currency", "FeeOriginal", "ConversionRate (A$1=)", "RateSource", "FeeAmountAUD"],
+  ];
+  let fxTotalAud = 0;
+  for (const f of fxSorted) {
+    const feeAud = round2(f.feeAud);
+    fxTotalAud += feeAud;
+    paypalFxRows.push([
+      f.iso,
+      f.currency,
+      round2(f.feeOriginal),
+      f.rate == null ? "" : round6(f.rate),
+      f.source,
+      feeAud,
+    ]);
+  }
+  paypalFxRows.push(["Grand Total", "", "", "", "", round2(fxTotalAud)]);
+
   const xlsx = buildXlsx([
     { name: "Combined Summary", rows: summaryRows },
     { name: "Shopify Fees", rows: [["Date", "OrderID", "GrossAmountAUD", "FeeExGST", "GSTOnFee", "FeeInclGST", "NetAmountAUD"], ...sheetRows["Shopify Payments"]] },
     { name: "Afterpay Fees", rows: [["Date", "OrderID", "GrossAmountAUD", "MerchantFeeExclGST", "MerchantFeeGST", "MerchantFeeInclGST", "NetAmountAUD"], ...sheetRows["Afterpay"]] },
     { name: "PayPal Fees", rows: [["Date", "OrderID", "OriginalCurrency", "GrossOriginalCurrency", "GrossAmountAUD", "FeeAmountAUD", "NetAmountAUD", "Type"], ...sheetRows["PayPal"]] },
+    { name: "PayPal FX", rows: paypalFxRows },
   ]);
 
   // 5. Reconciliation per gateway: allocated vs full source pool; report any

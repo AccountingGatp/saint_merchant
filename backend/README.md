@@ -160,10 +160,10 @@ own report gives the day's total fee, which is allocated across that day's order
 - **PayPal** — daily pool from sales + refunds + withdrawal fees, converted to
   AUD using **PayPal's own settlement rate** derived from the report's
   "General Currency Conversion" pairs (foreign-out / AUD-in). Any remaining
-  foreign fees are converted at the **ECB historical rate for that transaction
-  date** (`lib/fx.ts`, Frankfurter API — free, no key, keyed by day). Only
-  currencies that can't be resolved at all are excluded and surfaced in
-  `fxWarnings`. PayPal fees are GST-exempt (all in the ex-GST bucket).
+  foreign fees are converted at the **RBA historical rate for that transaction
+  date** (`lib/fx.ts`, RBA table F11.1 daily CSV — free, no key). Only currencies
+  the RBA doesn't publish are excluded and surfaced in `fxWarnings`. PayPal fees
+  are GST-exempt (all in the ex-GST bucket).
 
 ### Rounding / reconciliation
 
@@ -179,15 +179,16 @@ dates fall outside the selected window).
 
 FX is fully dynamic — nothing is hard-coded, so the pipeline is correct for any
 period. PayPal's own per-transaction settlement rate (from the report's
-conversion rows) is preferred; anything else is converted at the ECB reference
-rate for that transaction date via the Frankfurter API (`lib/fx.ts`). Rates are
-cached per `date|currency` (historical rates are immutable). If the FX service is
-unreachable or a currency is unsupported, those fees are excluded from AUD and
-listed in `fxWarnings`.
+conversion rows) is preferred; anything else is converted at the **RBA** rate for
+that transaction date (table F11.1, `A$1=XXX` columns = foreign per AUD). The
+daily CSV is fetched once and parsed in memory, with nearest-prior-business-day
+fallback for weekends/holidays. If the RBA service is unreachable, a currency is
+not published, or the date predates the file's coverage (starts 2023-01-03),
+those fees are excluded from AUD and listed in `fxWarnings`.
 
-> Requires outbound network access from the server to `api.frankfurter.dev`. On
-> Vercel this works by default; note the added latency (~one request per distinct
-> foreign-fee date) counts toward the function duration limit.
+> Requires outbound network access from the server to `www.rba.gov.au`. On Vercel
+> this works by default; the CSV is fetched at most once per warm function
+> instance.
 
 ### Column matching
 
