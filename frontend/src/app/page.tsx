@@ -2,7 +2,8 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
+import { BookOpen } from "lucide-react";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import {
@@ -13,6 +14,10 @@ import {
 const BACKEND_URL =
   // process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:4000";
   "https://saint-merchant-api.vercel.app";
+
+/** Standard Operating Procedure document (opens in a new tab). */
+const SOP_URL =
+  "https://docs.google.com/document/d/1kSFzI7YX5mJ4eFPRy2J18Zekco5-TGlagi0RBzvHk0I/edit?tab=t.0";
 
 type GatewayRecon = {
   gateway: string;
@@ -235,9 +240,20 @@ export default function Home() {
             · Reconciliation Upload
           </span>
         </h1>
-        <p className="text-xs text-muted-foreground">
-          5 reports · Shopify, PayPal &amp; Afterpay · CSV only
-        </p>
+        <div className="flex items-center gap-3">
+          <p className="text-xs text-muted-foreground">
+            5 reports · Shopify, PayPal &amp; Afterpay · CSV only
+          </p>
+          <a
+            href={SOP_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+          >
+            <BookOpen />
+            SOP
+          </a>
+        </div>
       </header>
 
       <div className="mb-3 flex items-center gap-3 rounded-md border bg-card px-3 py-2">
